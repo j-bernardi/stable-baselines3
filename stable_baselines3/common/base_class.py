@@ -232,6 +232,8 @@ class BaseAlgorithm(ABC):
     def _setup_lr_schedule(self) -> None:
         """Transform to callable if needed."""
         self.lr_schedule = get_schedule_fn(self.learning_rate)
+        # JB
+        self.m_lr_schedule = get_schedule_fn(self.learning_rate)
 
     def _update_current_progress_remaining(self, num_timesteps: int, total_timesteps: int) -> None:
         """
@@ -257,6 +259,13 @@ class BaseAlgorithm(ABC):
             optimizers = [optimizers]
         for optimizer in optimizers:
             update_learning_rate(optimizer, self.lr_schedule(self._current_progress_remaining))
+
+    # JB
+    def _update_m_learning_rate(self, optimizers: Union[List[th.optim.Optimizer], th.optim.Optimizer]) -> None:
+        if not isinstance(optimizers, list):
+            optimizers = [optimizers]
+        for optimizer in optimizers:
+            update_learning_rate(optimizer, self.m_lr_schedule(self._current_progress_remaining))
 
     def _excluded_save_params(self) -> List[str]:
         """

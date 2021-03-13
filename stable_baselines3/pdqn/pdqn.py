@@ -13,9 +13,13 @@ from stable_baselines3.common.utils import get_linear_fn, is_vectorized_observat
 from stable_baselines3.pdqn.policies import PDQNPolicy
 
 
+def random_mentor(obs, n_actions):
+    return np.random.randint(n_actions)
+
+
 class PDQN(OffPolicyAlgorithm):
     """
-    Deep Q-Network (PDQN)
+    Deep Pessimistic Q-Network (PDQN)
 
     Paper: https://arxiv.org/abs/1312.5602, https://www.nature.com/articles/nature14236
     Default hyperparameters are taken from the nature paper,
@@ -80,6 +84,9 @@ class PDQN(OffPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        # JB
+        pessimism=10.,
+        mentor=random_mentor,
     ):
 
         super(PDQN, self).__init__(
@@ -117,6 +124,22 @@ class PDQN(OffPolicyAlgorithm):
         self.exploration_schedule = None
         self.q_net, self.q_net_target = None, None
 
+
+        # JB
+        self.mentor = mentor
+        self.pessimism = pessimism
+        self.m_net, self.m_net_target = None, None
+        self.queries = []
+        print("ENV", self.env)
+        self.reward_range = self.env.get_attr("reward_range")[0]
+        print("RANGE", self.reward_range)
+        # since gym environments seem to not take env.reward_range seriously...
+        # (Cartpole is (-inf, inf))
+        if not self.reward_range[1] - self.reward_range[0] < np.inf:
+            self.reward_range = (-1, 1)  # hardcoded reward
+        assert self.reward_range[1] - self.reward_range[0] < np.inf, (
+            "env.reward_range is infinite. Manually set env.reward_range = (r_min, r_max)")
+
         if _init_setup_model:
             self._setup_model()
 
@@ -130,6 +153,9 @@ class PDQN(OffPolicyAlgorithm):
     def _create_aliases(self) -> None:
         self.q_net = self.policy.q_net
         self.q_net_target = self.policy.q_net_target
+
+        self.m_net = self.policy.m_net
+        self.m_net_target = self.policy.m_net_target
 
     def _on_step(self) -> None:
         """
@@ -145,38 +171,83 @@ class PDQN(OffPolicyAlgorithm):
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
         # Update learning rate according to schedule
         self._update_learning_rate(self.policy.optimizer)
+        self._update_m_learning_rate(self.policy.m_optimizer)
 
         losses = []
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            # mentor_replay_data = self.mentor_replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
             with th.no_grad():
                 # Compute the next Q-values using the target network
                 next_q_values = self.q_net_target(replay_data.next_observations)
+                # next_m_values = self.m_net_target(mentor_replay_data.next_observations)
+
                 # Follow greedy policy: use the one with the highest value
                 next_q_values, _ = next_q_values.max(dim=1)
+                # next_m_values, _ = next_m_values.max(dim=1)  # only 1 dim
+
                 # Avoid potential broadcast issue
                 next_q_values = next_q_values.reshape(-1, 1)
+                # next_m_values = next_m_values.reshape(-1, 1)
+
                 # 1-step TD target
                 target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+                # target_m_values = mentor_replay_data.rewards + (1 - mentor_replay_data.dones) * self.gamma * next_m_values
 
             # Get current Q-values estimates
             current_q_values = self.q_net(replay_data.observations)
+            # current_m_values = self.m_net(replay_data.observations)
 
             # Retrieve the q-values for the actions from the replay buffer
             current_q_values = th.gather(current_q_values, dim=1, index=replay_data.actions.long())
 
             # Compute Huber loss (less sensitive to outliers)
             loss = F.smooth_l1_loss(current_q_values, target_q_values)
+            
+            if self.pessimism == 0.:
+                pass
+
+            elif self.pessimism > 0.:
+                min_rew = self.reward_range[0]
+                max_rew = self.reward_range[1]
+                # Pessimistic Correction TODO - had to set manually before
+                assert min_rew == 0 or self.gamma < 1
+                if min_rew == 0:
+                    min_value = 0
+                else:
+                    min_value = min_rew / (1 - self.gamma)
+
+                # Geometric sum Q: should we do gamma ^ remaining on top?
+                pleasant_surprise = (current_q_values - min_value) / (max_rew - min_rew)
+
+                # print("Training")
+                # print("Q", current_q_values, min_value)
+                # print(max_rew, min_rew)
+                # print("Surprise", pleasant_surprise)
+
+                # TODO - verify time divide value. And will this fail on GPU?
+                pess_errors = self.pessimism * th.mean(
+                    th.square(pleasant_surprise), dim=1) / np.sqrt(self.num_timesteps)
+                loss = th.mean(pess_errors + loss)  # No weights
+            else:
+                raise NotImplementedError("Optimism not implemented")
+
             losses.append(loss.item())
 
             # Optimize the policy
             self.policy.optimizer.zero_grad()
+            self.policy.m_optimizer.zero_grad()
+
             loss.backward()
+
             # Clip gradient norm
+            # TODO - find parameters - is it returning for m or Q?
             th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+
             self.policy.optimizer.step()
+            self.policy.m_optimizer.step()
 
         # Increase update counter
         self._n_updates += gradient_steps
@@ -184,7 +255,7 @@ class PDQN(OffPolicyAlgorithm):
         logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         logger.record("train/loss", np.mean(losses))
 
-    def predict(
+    def pess_predict(
         self,
         observation: np.ndarray,
         state: Optional[np.ndarray] = None,
@@ -208,8 +279,53 @@ class PDQN(OffPolicyAlgorithm):
             else:
                 action = np.array(self.action_space.sample())
         else:
-            action, state = self.policy.predict(observation, state, mask, deterministic)
-        return action, state
+            # WAS
+            # action, state = self.policy.predict(observation, state, mask, deterministic)
+            ######### from common.policies.BasePolicy #################
+            if isinstance(observation, dict):
+                observation = ObsDictWrapper.convert_dict(observation)
+            else:
+                observation = np.array(observation)
+
+            # Handle the different cases for images
+            # as PyTorch use channel first format
+            observation = maybe_transpose(observation, self.observation_space)
+
+            vectorized_env = is_vectorized_observation(observation, self.observation_space)
+
+            observation = observation.reshape((-1,) + self.observation_space.shape)
+
+            observation = th.as_tensor(observation).to(self.device)
+
+            #with th.no_grad():
+            #    actions = self.policy._predict(observation, deterministic=deterministic)
+            # Convert to numpy
+            #actions = actions.cpu().numpy()
+            ############################################################
+
+
+            # Final dim is the world model pred?
+            with th.no_grad():
+                mentor_value = self.policy._m_predict(observation)  # output = actions + 1
+                pess_preds = self.policy._pess_values(observation)
+                pess_value, _ = pess_preds.max(dim=-1)
+    
+            # print(pess_value, "\t", mentor_value)
+
+            mentor_act = (
+                mentor_value > pess_value + 0.01
+                or self.num_timesteps < 1000  # total_timesteps / 10
+            )
+
+            if self.pessimism < 0:  # Optimistic
+                mentor_act = False
+            if mentor_act:
+                action = self.mentor(state, self.env.action_space.n)
+                self.queries.append(self.num_timesteps)
+            else:
+                action = pess_preds.argmax(dim=1).reshape(-1).cpu().numpy()[0]
+
+        return action, state, mentor_act
 
     def learn(
         self,
@@ -237,9 +353,10 @@ class PDQN(OffPolicyAlgorithm):
         )
 
     def _excluded_save_params(self) -> List[str]:
-        return super(PDQN, self)._excluded_save_params() + ["q_net", "q_net_target"]
+        return super(PDQN, self)._excluded_save_params() + [
+            "q_net", "q_net_target", "m_net", "m_net_target"]
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
-        state_dicts = ["policy", "policy.optimizer"]
+        state_dicts = ["policy", "policy.optimizer", "policy.m_optimizer"]
 
         return state_dicts, []

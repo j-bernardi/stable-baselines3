@@ -174,6 +174,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             self.device,
             optimize_memory_usage=self.optimize_memory_usage,
         )
+
         self.policy = self.policy_class(  # pytype:disable=not-instantiable
             self.observation_space,
             self.action_space,
@@ -181,6 +182,15 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             **self.policy_kwargs,  # pytype:disable=not-instantiable
         )
         self.policy = self.policy.to(self.device)
+
+        # JB
+        self.mentor_replay_buffer = ReplayBuffer(
+            self.buffer_size,
+            self.observation_space,
+            gym.spaces.Discrete(1),  # DIFF
+            self.device,
+            optimize_memory_usage=self.optimize_memory_usage,
+        )
 
         # Convert train freq parameter to TrainFreq object
         self._convert_train_freq()

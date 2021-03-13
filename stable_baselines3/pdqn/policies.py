@@ -65,6 +65,11 @@ class QNetwork(BasePolicy):
         action = q_values.argmax(dim=1).reshape(-1)
         return action
 
+    # JB
+    def _m_predict(self, observation: th.Tensor, deterministic: bool = True) -> th.Tensor:
+
+        return self.m_forward(observation).reshape(-1)
+
     def _get_constructor_parameters(self) -> Dict[str, Any]:
         data = super()._get_constructor_parameters()
 
@@ -139,12 +144,26 @@ class PDQNPolicy(BasePolicy):
             "normalize_images": normalize_images,
         }
 
+        # JB
+        self.m_net_args = {
+            "observation_space": self.observation_space,
+            "action_space": gym.spaces.Discrete(1),
+            "net_arch": self.net_arch,
+            "activation_fn": self.activation_fn,
+            "normalize_images": normalize_images,
+        }
+
         self.q_net, self.q_net_target = None, None
+
+        # JB
+        self.m_net, self.m_net_target = None, None
+
+        # Build both with the same schedule class
         self._build(lr_schedule)
 
     def _build(self, lr_schedule: Schedule) -> None:
         """
-        Create the network and the optimizer.
+        Create the network and the optimizer for Q and M networks.
 
         :param lr_schedule: Learning rate schedule
             lr_schedule(1) is the initial learning rate
@@ -153,20 +172,41 @@ class PDQNPolicy(BasePolicy):
         self.q_net = self.make_q_net()
         self.q_net_target = self.make_q_net()
         self.q_net_target.load_state_dict(self.q_net.state_dict())
-
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+
+        # JB - same setup but only predict a value
+        self.m_net = self.make_m_net()
+        self.m_net_target = self.make_m_net()
+        self.m_net_target.load_state_dict(self.m_net.state_dict())
+        self.m_optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
 
     def make_q_net(self) -> QNetwork:
         # Make sure we always have separate networks for features extractors etc
         net_args = self._update_features_extractor(self.net_args, features_extractor=None)
         return QNetwork(**net_args).to(self.device)
 
+    # JB
+    def make_m_net(self) -> QNetwork:
+        # Make sure we always have separate networks for features extractors etc
+        net_args = self._update_features_extractor(self.m_net_args, features_extractor=None)
+        return QNetwork(**net_args).to(self.device)
+
     def forward(self, obs: th.Tensor, deterministic: bool = True) -> th.Tensor:
+        """Do inference using pessimistic Q net"""
         return self._predict(obs, deterministic=deterministic)
 
+    def _pess_values(self, obs: th.Tensor) -> th.Tensor:
+
+        return self.q_net.forward(obs)
+
     def _predict(self, obs: th.Tensor, deterministic: bool = True) -> th.Tensor:
+        """Predict using pessimistic Q net"""
         return self.q_net._predict(obs, deterministic=deterministic)
+
+    def _m_predict(self, obs: th.Tensor) -> th.Tensor:
+        """Predict using pessimistic Q net"""
+        return self.m_net._predict(obs)
 
     def _get_constructor_parameters(self) -> Dict[str, Any]:
         data = super()._get_constructor_parameters()
@@ -219,7 +259,7 @@ class CnnPessPolicy(PDQNPolicy):
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
     ):
-        super(CnnPolicy, self).__init__(
+        super(CnnPessPolicy, self).__init__(
             observation_space,
             action_space,
             lr_schedule,
