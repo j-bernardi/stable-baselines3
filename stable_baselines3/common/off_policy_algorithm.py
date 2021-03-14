@@ -280,6 +280,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 callback=callback,
                 learning_starts=self.learning_starts,
                 replay_buffer=self.replay_buffer,
+                mentor_replay_buffer=self.mentor_replay_buffer,
                 log_interval=log_interval,
             )
 
@@ -345,6 +346,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             # Discrete case, no need to normalize or clip
             buffer_action = unscaled_action
             action = buffer_action
+        print("ACTION", action)
         return action, buffer_action
 
     def _dump_logs(self) -> None:
@@ -429,6 +431,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         callback: BaseCallback,
         train_freq: TrainFreq,
         replay_buffer: ReplayBuffer,
+        mentor_replay_buffer: Optional[ReplayBuffer] = None,
         action_noise: Optional[ActionNoise] = None,
         learning_starts: int = 0,
         log_interval: Optional[int] = None,
@@ -476,7 +479,17 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                     self.actor.reset_noise()
 
                 # Select action randomly or according to policy
-                action, buffer_action = self._sample_action(learning_starts, action_noise)
+
+                act_return = self._sample_action(learning_starts, action_noise)
+
+                if len(act_return) == 3:
+                    # Pessimistic action
+                    action, buffer_action, mentor_acted = act_return
+                    if mentor_replay_buffer is None:
+                        raise ValueError()
+                else:
+                    action, buffer_action = act_return
+                    mentor_acted = None
 
                 # Rescale and perform action
                 new_obs, reward, done, infos = env.step(action)
@@ -498,6 +511,9 @@ class OffPolicyAlgorithm(BaseAlgorithm):
 
                 # Store data in replay buffer (normalized action and unnormalized observation)
                 self._store_transition(replay_buffer, buffer_action, new_obs, reward, done, infos)
+                # TODO also store SARS' in mentor buffer when M has n+1 outputs
+                if mentor_replay_buffer is not None and mentor_acted:
+                    self._store_transition(mentor_replay_buffer, 0, new_obs, reward, done, infos)
 
                 self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
 

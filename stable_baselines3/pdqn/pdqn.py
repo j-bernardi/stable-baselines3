@@ -6,6 +6,7 @@ import torch as th
 from torch.nn import functional as F
 
 from stable_baselines3.common import logger
+from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.preprocessing import maybe_transpose
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
@@ -14,7 +15,7 @@ from stable_baselines3.pdqn.policies import PDQNPolicy
 
 
 def random_mentor(obs, n_actions):
-    return np.random.randint(n_actions)
+    return np.random.randint(n_actions, size=1)
 
 
 class PDQN(OffPolicyAlgorithm):
@@ -174,41 +175,47 @@ class PDQN(OffPolicyAlgorithm):
         self._update_m_learning_rate(self.policy.m_optimizer)
 
         losses = []
+        mentor_losses = []
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
-            # mentor_replay_data = self.mentor_replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            mentor_replay_data = self.mentor_replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
             with th.no_grad():
                 # Compute the next Q-values using the target network
                 next_q_values = self.q_net_target(replay_data.next_observations)
-                # next_m_values = self.m_net_target(mentor_replay_data.next_observations)
+                next_m_values = self.m_net_target(mentor_replay_data.next_observations)
 
                 # Follow greedy policy: use the one with the highest value
                 next_q_values, _ = next_q_values.max(dim=1)
-                # next_m_values, _ = next_m_values.max(dim=1)  # only 1 dim
+                next_m_values, _ = next_m_values.max(dim=1)  # only 1 dim
 
                 # Avoid potential broadcast issue
                 next_q_values = next_q_values.reshape(-1, 1)
-                # next_m_values = next_m_values.reshape(-1, 1)
+                next_m_values = next_m_values.reshape(-1, 1)
 
                 # 1-step TD target
                 target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
-                # target_m_values = mentor_replay_data.rewards + (1 - mentor_replay_data.dones) * self.gamma * next_m_values
+                target_m_values = mentor_replay_data.rewards + (1 - mentor_replay_data.dones) * self.gamma * next_m_values
 
             # Get current Q-values estimates
             current_q_values = self.q_net(replay_data.observations)
-            # current_m_values = self.m_net(replay_data.observations)
+            current_m_values = self.m_net(replay_data.observations)
 
             # Retrieve the q-values for the actions from the replay buffer
             current_q_values = th.gather(current_q_values, dim=1, index=replay_data.actions.long())
 
+            # Correct sampling?
+            # TODO - this will become higher dim
+            current_m_values = th.gather(current_m_values, dim=1, index=mentor_replay_data.actions.long())
+
             # Compute Huber loss (less sensitive to outliers)
             loss = F.smooth_l1_loss(current_q_values, target_q_values)
-            
+            mentor_loss = F.smooth_l1_loss(current_m_values, target_m_values)
+
+            # Pessimism - only applies to Q network
             if self.pessimism == 0.:
                 pass
-
             elif self.pessimism > 0.:
                 min_rew = self.reward_range[0]
                 max_rew = self.reward_range[1]
@@ -235,15 +242,22 @@ class PDQN(OffPolicyAlgorithm):
                 raise NotImplementedError("Optimism not implemented")
 
             losses.append(loss.item())
+            mentor_losses.append(mentor_loss.item())
+
 
             # Optimize the policy
             self.policy.optimizer.zero_grad()
             self.policy.m_optimizer.zero_grad()
 
             loss.backward()
+            mentor_loss.backward()
 
             # Clip gradient norm
             # TODO - find parameters - is it returning for m or Q?
+            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+
+            # TODO get policy m_parameters ? 
+            # print("PARAMETERS", self.policy.parameters())
             th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
 
             self.policy.optimizer.step()
@@ -254,6 +268,42 @@ class PDQN(OffPolicyAlgorithm):
 
         logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         logger.record("train/loss", np.mean(losses))
+
+    def _sample_action(
+        self, learning_starts: int, action_noise: Optional[ActionNoise] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Sampling not allowed?"""
+        # raise NotImplementedError("Not implemented - need to follow pess_predict")
+
+        # if self.num_timesteps < learning_starts and not (self.use_sde and self.use_sde_at_warmup):
+        #     # Warmup phase
+        #     unscaled_action = np.array([self.action_space.sample()])
+        # else:
+        #     # Note: when using continuous actions,
+        #     # we assume that the policy uses tanh to scale the action
+        #     # We use non-deterministic action in the case of SAC, for TD3, it does not matter
+        #     unscaled_action, _ = self.predict(self._last_obs, deterministic=False)
+
+        unscaled_action, _, mentor_acted = self.pess_predict(self._last_obs, deterministic=False)
+
+        # Rescale the action from [low, high] to [-1, 1]
+        # if isinstance(self.action_space, gym.spaces.Box):
+        #     scaled_action = self.policy.scale_action(unscaled_action)
+
+        #     # Add noise to the action (improve exploration)
+        #     if action_noise is not None:
+        #         scaled_action = np.clip(scaled_action + action_noise(), -1, 1)
+
+        #     # We store the scaled action in the buffer
+        #     buffer_action = scaled_action
+        #     action = self.policy.unscale_action(scaled_action)
+        # else:
+        #     # Discrete case, no need to normalize or clip
+        #     buffer_action = unscaled_action
+        #     action = buffer_action
+        # return action, buffer_action
+        return unscaled_action, unscaled_action, mentor_acted
+
 
     def pess_predict(
         self,
@@ -272,7 +322,7 @@ class PDQN(OffPolicyAlgorithm):
         :return: the model's action and the next state
             (used in recurrent policies)
         """
-        if not deterministic and np.random.rand() < self.exploration_rate:
+        if False:  # not deterministic and np.random.rand() < self.exploration_rate:  NO SAMPLING
             if is_vectorized_observation(maybe_transpose(observation, self.observation_space), self.observation_space):
                 n_batch = observation.shape[0]
                 action = np.array([self.action_space.sample() for _ in range(n_batch)])
@@ -323,7 +373,7 @@ class PDQN(OffPolicyAlgorithm):
                 action = self.mentor(state, self.env.action_space.n)
                 self.queries.append(self.num_timesteps)
             else:
-                action = pess_preds.argmax(dim=1).reshape(-1).cpu().numpy()[0]
+                action = pess_preds.argmax(dim=1).reshape(-1).cpu().numpy()
 
         return action, state, mentor_act
 
